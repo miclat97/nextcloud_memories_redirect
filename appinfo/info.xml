@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+	<id>memories_video_redirect</id>
+	<name>Memories Video Redirect</name>
+	<summary>Przekierowuje otwieranie plików wideo z aplikacji Pliki (Files) bezpośrednio do odtwarzacza Memories (go-vod / HLS)</summary>
+	<description><![CDATA[Lekka wtyczka integrująca aplikację Pliki (files) z odtwarzaczem wideo aplikacji Wspomnienia (Memories).
+
+Funkcje:
+- Przechwytuje otwieranie plików wideo (video/*) w aplikacji Pliki i otwiera je bezpośrednio w odtwarzaczu Memories z obsługą transkodowania w locie (go-vod / ffmpeg HLS/DASH).
+- Blokuje domyślny odtwarzacz Nextcloud Viewer przed pobieraniem pełnego surowego pliku wideo przez WebDAV w tle.
+- Dodaje akcję „Odtwórz w Memories” do menu kontekstowego plików wideo jako akcję domyślną.
+- Automatycznie indeksuje w locie nowo wgrane pliki wideo w bazie Memories (oc_memories), zapobiegając błędom 404.
+- Zachowuje czysty adres URL katalogu w historii przeglądarki, dzięki czemu przycisk „Wstecz” (oraz zamknięcie odtwarzacza w Memories) wraca bezpośrednio do katalogu w Plikach bez pętli przekierowań.]]></description>
+	<version>1.0.0</version>
+	<licence>agpl</licence>
+	<author>miclat97</author>
+	<namespace>MemoriesVideoRedirect</namespace>
+	<types>
+		<filesystem/>
+	</types>
+	<category>multimedia</category>
+	<category>files</category>
+	<category>integration</category>
+	<dependencies>
+		<php min-version="8.1"/>
+		<nextcloud min-version="27" max-version="36"/>
+	</dependencies>
+</info>
