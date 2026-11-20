@@ -20,17 +20,6 @@ class SettingsController extends Controller {
 	}
 
 	public function save(): JSONResponse {
-		$params = $this->request->getParams();
-		if (!is_array($params) || count($params) === 0) {
-			$rawBody = @file_get_contents('php://input');
-			if (is_string($rawBody) && $rawBody !== '') {
-				$decoded = json_decode($rawBody, true);
-				if (is_array($decoded)) {
-					$params = $decoded;
-				}
-			}
-		}
-
 		$allowedKeys = [
 			'redirectVideos',
 			'redirectPhotos',
@@ -43,6 +32,29 @@ class SettingsController extends Controller {
 			'excludedPaths',
 			'customActionLabel',
 		];
+
+		$params = $this->request->getParams();
+		if (!is_array($params)) {
+			$params = [];
+		}
+
+		$hasAllowedKey = false;
+		foreach ($allowedKeys as $key) {
+			if (array_key_exists($key, $params)) {
+				$hasAllowedKey = true;
+				break;
+			}
+		}
+
+		if (!$hasAllowedKey) {
+			$rawBody = @file_get_contents('php://input');
+			if (is_string($rawBody) && $rawBody !== '') {
+				$decoded = json_decode($rawBody, true);
+				if (is_array($decoded)) {
+					$params = array_merge($params, $decoded);
+				}
+			}
+		}
 
 		$payload = [];
 		foreach ($allowedKeys as $key) {
