@@ -1,9 +1,9 @@
 /**
  * memories_video_redirect — Frontend Interceptor (Poziom 1 + Poziom 2)
  *
- * Przechwytuje otwieranie plików wideo (video/*) w aplikacji Pliki (apps/files)
- * i przekierowuje je bezpośrednio do odtwarzacza HLS/DASH (go-vod / ffmpeg) w Memories,
- * blokując domyślny Nextcloud Viewer przed pobieraniem surowego pliku przez WebDAV.
+ * Przechwytuje otwieranie plików wideo (video/*), zdjęć (image/*) oraz wybranych
+ * własnych rozszerzeń w aplikacji Pliki (apps/files) i przekierowuje je bezpośrednio
+ * do aplikacji Memories, blokując domyślny Nextcloud Viewer przed pobieraniem surowych plików.
  *
  * Skrypt nie wymaga bundlera (Webpack/Vite) — działa natychmiast po `occ app:enable`.
  */
@@ -17,6 +17,7 @@
 
 	const APP_ID = 'memories_video_redirect';
 	const ACTION_ID = 'memories-video-redirect';
+	const LEGACY_IMAGE_ACTION_ID = 'memories-image-redirect';
 
 	/** Rozszerzenia plików wideo rozpoznawane niezależnie od zadeklarowanego typu MIME */
 	const VIDEO_EXTENSIONS = new Set([
@@ -44,8 +45,81 @@
 		'video/3gpp2'
 	]);
 
-	/** Ikona SVG przycisku "Odtwórz w Memories" */
+	/** Rozszerzenia plików zdjęć rozpoznawane niezależnie od zadeklarowanego typu MIME */
+	const IMAGE_EXTENSIONS = new Set([
+		'jpg', 'jpeg', 'jpe', 'jfif', 'png', 'gif', 'webp',
+		'heic', 'heif', 'avif', 'jxl', 'bmp', 'dib',
+		'tif', 'tiff', 'ico', 'cur',
+		'dng', 'raw', 'cr2', 'cr3', 'nef', 'nrw', 'arw', 'srf', 'sr2',
+		'orf', 'rw2', 'raf', 'pef', 'srw', 'x3f', '3fr', 'erf', 'kdc', 'mrw',
+		'svg', 'svgz'
+	]);
+
+	/** Dodatkowe typy MIME zdjęć */
+	const EXTRA_IMAGE_MIMES = new Set([
+		'image/jpeg',
+		'image/jpg',
+		'image/png',
+		'image/gif',
+		'image/webp',
+		'image/heic',
+		'image/heif',
+		'image/heic-sequence',
+		'image/heif-sequence',
+		'image/avif',
+		'image/jxl',
+		'image/bmp',
+		'image/x-ms-bmp',
+		'image/tiff',
+		'image/x-tiff',
+		'image/x-adobe-dng',
+		'image/x-canon-cr2',
+		'image/x-canon-cr3',
+		'image/x-nikon-nef',
+		'image/x-sony-arw',
+		'image/x-olympus-orf',
+		'image/x-panasonic-rw2',
+		'image/x-fuji-raf',
+		'image/svg+xml'
+	]);
+
+	/** Mapowanie wybranych typów MIME na rozszerzenia dla wykluczeń w OCA.Viewer */
+	const MIME_TO_EXTENSIONS = {
+		'image/svg+xml': ['svg', 'svgz'],
+		'image/gif': ['gif'],
+		'image/tiff': ['tif', 'tiff'],
+		'image/x-tiff': ['tif', 'tiff'],
+		'image/webp': ['webp'],
+		'image/png': ['png'],
+		'image/jpeg': ['jpg', 'jpeg'],
+		'image/heic': ['heic'],
+		'image/heif': ['heif'],
+		'image/avif': ['avif'],
+		'image/bmp': ['bmp'],
+		'video/mp4': ['mp4', 'm4v'],
+		'video/webm': ['webm'],
+		'video/quicktime': ['mov'],
+		'video/x-matroska': ['mkv'],
+		'video/ogg': ['ogv', 'ogg']
+	};
+
+	/** Ikona SVG przycisku "Otwórz w Memories" */
 	const PLAY_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 14.5v-9l6 4.5-6 4.5z"/></svg>';
+
+	/** Domyślna konfiguracja (nadpisywana z panelu administratora przez IInitialState) */
+	let runtimeConfig = {
+		redirectVideos: true,
+		redirectPhotos: true,
+		customExtensions: new Set(),
+		excludedExtensions: new Set(['svg', 'svgz']),
+		interceptDefaultClick: true,
+		blockDefaultViewer: true,
+		onTheFlyIndexing: true,
+		enableSingleItemFallback: true,
+		excludedPaths: [],
+		customActionLabel: ''
+	};
+	let configLoadedFromInitialState = false;
 
 	/** Stan blokady zapobiegający wielokrotnemu wyzwoleniu przekierowania dla tego samego kliknięcia */
 	let redirectInFlight = false;
@@ -57,24 +131,143 @@
 	const originalReplaceState = window.history.replaceState.bind(window.history);
 
 	/**
-	 * Zwraca przetłumaczoną etykietę akcji w zależności od języka interfejsu Nextcloud.
+	 * Bezpiecznie dekoduje ciąg Base64 (UTF-8) używany przez Nextcloud IInitialState.
 	 */
-	function getActionLabel() {
+	function decodeBase64Utf8(base64Str) {
+		const binary = window.atob(base64Str);
+		if (typeof TextDecoder !== 'undefined') {
+			const bytes = new Uint8Array(binary.length);
+			for (let i = 0; i < binary.length; i++) {
+				bytes[i] = binary.charCodeAt(i);
+			}
+			return new TextDecoder('utf-8').decode(bytes);
+		}
+		return decodeURIComponent(escape(binary));
+	}
+
+	/**
+	 * Normalizuje listę rozszerzeń do zbioru małych liter bez wiodących kropek.
+	 */
+	function toExtensionSet(list) {
+		const result = new Set();
+		if (!Array.isArray(list)) {
+			return result;
+		}
+		list.forEach(function (item) {
+			if (typeof item !== 'string') {
+				return;
+			}
+			const clean = item.trim().replace(/^\.+/, '').toLowerCase();
+			if (clean) {
+				result.add(clean);
+			}
+		});
+		return result;
+	}
+
+	/**
+	 * Normalizuje ścieżkę katalogu do postaci `/foo/bar` (lub `/`).
+	 */
+	function normalizeDirPath(path) {
+		if (!path || typeof path !== 'string') {
+			return '/';
+		}
+		let clean = path.trim().replace(/\/+/g, '/');
+		if (!clean.startsWith('/')) {
+			clean = '/' + clean;
+		}
+		if (clean.length > 1 && clean.endsWith('/')) {
+			clean = clean.slice(0, -1);
+		}
+		return clean || '/';
+	}
+
+	/**
+	 * Odczytuje konfigurację przekazaną z PHP (`LoadScriptsListener` -> `IInitialState`).
+	 */
+	function refreshRuntimeConfigFromInitialState() {
+		if (configLoadedFromInitialState) {
+			return;
+		}
+		let parsed = null;
+		try {
+			if (window.OCP && window.OCP.InitialState && typeof window.OCP.InitialState.loadState === 'function') {
+				parsed = window.OCP.InitialState.loadState(APP_ID, 'config', null);
+			}
+		} catch (_) {
+			parsed = null;
+		}
+
+		if (!parsed || typeof parsed !== 'object') {
+			try {
+				const el = document.getElementById('initial-state-' + APP_ID + '-config');
+				if (el && el.value) {
+					parsed = JSON.parse(decodeBase64Utf8(el.value));
+				}
+			} catch (_) {
+				parsed = null;
+			}
+		}
+
+		if (!parsed || typeof parsed !== 'object') {
+			return;
+		}
+
+		configLoadedFromInitialState = true;
+		runtimeConfig = {
+			redirectVideos: parsed.redirectVideos !== undefined ? Boolean(parsed.redirectVideos) : true,
+			redirectPhotos: parsed.redirectPhotos !== undefined ? Boolean(parsed.redirectPhotos) : true,
+			customExtensions: toExtensionSet(parsed.customExtensions),
+			excludedExtensions: parsed.excludedExtensions !== undefined
+				? toExtensionSet(parsed.excludedExtensions)
+				: new Set(['svg', 'svgz']),
+			interceptDefaultClick: parsed.interceptDefaultClick !== undefined ? Boolean(parsed.interceptDefaultClick) : true,
+			blockDefaultViewer: parsed.blockDefaultViewer !== undefined ? Boolean(parsed.blockDefaultViewer) : true,
+			onTheFlyIndexing: parsed.onTheFlyIndexing !== undefined ? Boolean(parsed.onTheFlyIndexing) : true,
+			enableSingleItemFallback: parsed.enableSingleItemFallback !== undefined ? Boolean(parsed.enableSingleItemFallback) : true,
+			excludedPaths: Array.isArray(parsed.excludedPaths)
+				? parsed.excludedPaths.map(normalizeDirPath)
+				: [],
+			customActionLabel: typeof parsed.customActionLabel === 'string' ? parsed.customActionLabel.trim() : ''
+		};
+	}
+
+	/**
+	 * Sprawdza, czy podany katalog należy do wykluczonych ścieżek.
+	 */
+	function isPathExcluded(dir) {
+		if (!runtimeConfig.excludedPaths || runtimeConfig.excludedPaths.length === 0) {
+			return false;
+		}
+		const normDir = normalizeDirPath(dir);
+		for (let i = 0; i < runtimeConfig.excludedPaths.length; i++) {
+			const excluded = runtimeConfig.excludedPaths[i];
+			if (excluded === '/' || normDir === excluded || normDir.startsWith(excluded + '/')) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Zwraca przetłumaczoną etykietę akcji w menu kontekstowym.
+	 */
+	function getActionLabel(mediaType) {
+		if (runtimeConfig.customActionLabel) {
+			return runtimeConfig.customActionLabel;
+		}
+		const defaultText = mediaType === 'video' ? 'Odtwórz w Memories' : 'Otwórz w Memories';
 		try {
 			if (typeof window.t === 'function') {
-				const translated = window.t(APP_ID, 'Odtwórz w Memories');
+				const translated = window.t(APP_ID, defaultText);
 				if (translated) {
 					return translated;
 				}
 			}
-			const lang = (document.documentElement.lang || navigator.language || 'pl').toLowerCase();
-			if (lang.startsWith('pl')) {
-				return 'Odtwórz w Memories';
-			}
 		} catch (_) {
 			// Ignoruj błędy lokalizacji
 		}
-		return 'Odtwórz w Memories';
+		return defaultText;
 	}
 
 	/**
@@ -118,44 +311,97 @@
 	}
 
 	/**
-	 * Sprawdza, czy podany typ MIME lub nazwa pliku oznacza plik wideo.
+	 * Sprawdza, czy typ MIME odpowiada wykluczonemu rozszerzeniu (np. image/svg+xml dla svg).
 	 */
-	function isVideoByMimeOrName(mime, nameOrPath) {
-		if (mime && typeof mime === 'string') {
-			const lowerMime = mime.trim().toLowerCase();
-			if (lowerMime.startsWith('video/') || EXTRA_VIDEO_MIMES.has(lowerMime)) {
-				return true;
-			}
-			// Jeśli to folder, nigdy nie traktuj jako wideo
-			if (lowerMime === 'httpd/unix-directory' || lowerMime === 'inode/directory') {
-				return false;
-			}
+	function isMimeExcluded(lowerMime) {
+		if (!lowerMime || runtimeConfig.excludedExtensions.size === 0) {
+			return false;
 		}
-		const ext = getFileExtension(nameOrPath);
-		return ext !== '' && VIDEO_EXTENSIONS.has(ext);
+		const mappedExts = MIME_TO_EXTENSIONS[lowerMime];
+		if (Array.isArray(mappedExts) && mappedExts.length > 0) {
+			return mappedExts.every(function (ext) {
+				return runtimeConfig.excludedExtensions.has(ext);
+			});
+		}
+		return false;
 	}
 
 	/**
-	 * Sprawdza, czy obiekt Node z `@nextcloud/files` (lub `OCA.Files`) reprezentuje plik wideo.
+	 * Rozpoznaje kategorię pliku podlegającą przekierowaniu ('video' | 'photo' | 'custom' | null).
 	 */
-	function isVideoNode(node) {
-		if (!node || typeof node !== 'object') {
-			return false;
+	function classifyFileByMimeOrName(mime, nameOrPath) {
+		const lowerMime = typeof mime === 'string' ? mime.trim().toLowerCase() : '';
+		if (lowerMime === 'httpd/unix-directory' || lowerMime === 'inode/directory') {
+			return null;
 		}
-		// Wyklucz katalogi
+
+		const ext = getFileExtension(nameOrPath);
+		if (ext !== '' && runtimeConfig.excludedExtensions.has(ext)) {
+			return null;
+		}
+		if (ext === '' && isMimeExcluded(lowerMime)) {
+			return null;
+		}
+
+		if (ext !== '' && runtimeConfig.customExtensions.has(ext)) {
+			return 'custom';
+		}
+
+		if (runtimeConfig.redirectVideos) {
+			if (
+				(lowerMime && (lowerMime.startsWith('video/') || EXTRA_VIDEO_MIMES.has(lowerMime)))
+				|| (ext !== '' && VIDEO_EXTENSIONS.has(ext))
+			) {
+				return 'video';
+			}
+		}
+
+		if (runtimeConfig.redirectPhotos) {
+			if (
+				(lowerMime && (lowerMime.startsWith('image/') || EXTRA_IMAGE_MIMES.has(lowerMime)))
+				|| (ext !== '' && IMAGE_EXTENSIONS.has(ext))
+			) {
+				return 'photo';
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Zwraca kategorię obiektu Node z `@nextcloud/files` (lub `OCA.Files`), albo `null`.
+	 */
+	function classifyNode(node) {
+		if (!node || typeof node !== 'object') {
+			return null;
+		}
 		if (node.type === 'folder' || node.type === 'dir') {
-			return false;
+			return null;
 		}
 		const mime = node.mime || node.mimetype || (node.attributes && node.attributes['content-type']) || '';
 		if (mime === 'httpd/unix-directory' || mime === 'inode/directory') {
-			return false;
+			return null;
 		}
 		const name = node.basename || node.name || node.path || node.filename || '';
-		return isVideoByMimeOrName(mime, name);
+		return classifyFileByMimeOrName(mime, name);
+	}
+
+	function isTargetNode(node) {
+		return classifyNode(node) !== null;
+	}
+
+	function isAutoRedirectNode(node) {
+		if (!runtimeConfig.interceptDefaultClick) {
+			return false;
+		}
+		if (!isTargetNode(node)) {
+			return false;
+		}
+		return !isPathExcluded(extractCurrentDir(node));
 	}
 
 	/**
-	 * Wyciąga ID pliku (liczba > 0) z obiektu Node lub wiersza DOM.
+	 * Wyciąga ID pliku (liczba > 0) z obiektu Node.
 	 */
 	function extractFileIdFromNode(node) {
 		if (!node || typeof node !== 'object') {
@@ -204,9 +450,9 @@
 
 	/**
 	 * Natychmiast zatrzymuje domyślny odtwarzacz `OCA.Viewer` oraz przerywa ewentualne
-	 * pobieranie strumienia WebDAV przez element `<video>`, zanim zdąży pobrać plik w tle.
+	 * pobieranie strumienia WebDAV przez elementy `<video>` lub `<img>` w modalu Viewera.
 	 */
-	function abortDefaultViewerAndVideoDownload() {
+	function abortDefaultViewerAndMediaDownload() {
 		try {
 			// 1. Zatrzymaj wszystkie elementy <video> wewnątrz modala #viewer
 			const viewerVideos = document.querySelectorAll('#viewer video, .viewer video, .plyr video');
@@ -223,7 +469,17 @@
 				}
 			});
 
-			// 2. Zamknij OCA.Viewer jeśli zdążył zmienić swój stan
+			// 2. Zatrzymaj podgląd obrazów w #viewer przed pełnym pobraniem
+			const viewerImages = document.querySelectorAll('#viewer img, .viewer img');
+			viewerImages.forEach(function (imgEl) {
+				try {
+					imgEl.removeAttribute('src');
+				} catch (_) {
+					// Ignoruj
+				}
+			});
+
+			// 3. Zamknij OCA.Viewer jeśli zdążył zmienić swój stan
 			if (window.OCA && window.OCA.Viewer && typeof window.OCA.Viewer.close === 'function') {
 				if (window.OCA.Viewer.file || window.OCA.Viewer.fileInfo) {
 					window.OCA.Viewer.close();
@@ -237,9 +493,6 @@
 	/**
 	 * Czyści bieżący wpis w `window.history`, usuwając parametr `?openfile=...` (oraz `?editing=...`)
 	 * i ewentualny sufiks `/<fileid>` ze ścieżki `/apps/files/<view>/<fileid>`.
-	 *
-	 * Dzięki temu po kliknięciu przycisku "Wstecz" w przeglądarce (lub zamknięciu odtwarzacza w Memories)
-	 * użytkownik wraca do czystego widoku katalogu w Plikach bez ponownego wyzwalania przekierowania!
 	 */
 	function ensureCleanFilesHistoryState(preferredDir) {
 		try {
@@ -259,7 +512,6 @@
 				modified = true;
 			}
 
-			// Usuń ID pliku z końca ścieżki `/apps/files/<view>/<fileid>` -> `/apps/files/<view>`
 			const cleanedPath = currentUrl.pathname.replace(/(\/apps\/files\/[^/]+)\/\d+\/?$/, '$1');
 			if (cleanedPath !== currentUrl.pathname) {
 				currentUrl.pathname = cleanedPath;
@@ -275,8 +527,7 @@
 	}
 
 	/**
-	 * Oblicza przybliżony `dayid` (liczba dni od 1970-01-01 UTC) jako lokalny fallback,
-	 * używany wyłącznie gdyby endpoint PHP nie odpowiedział.
+	 * Oblicza przybliżony `dayid` (liczba dni od 1970-01-01 UTC) jako lokalny fallback.
 	 */
 	function computeFallbackDayId(mtimeMsOrSec) {
 		if (mtimeMsOrSec && Number.isFinite(Number(mtimeMsOrSec))) {
@@ -290,12 +541,7 @@
 	}
 
 	/**
-	 * Główna funkcja przekierowująca wybrany plik wideo do odtwarzacza w Memories.
-	 *
-	 * 1. Blokuje `OCA.Viewer` przed pobraniem pliku w tle.
-	 * 2. Czyści aktualny URL w `window.history` (usuwa `?openfile=true`), aby przycisk "Wstecz" działał poprawnie.
-	 * 3. Odpytuje `GET /apps/memories_video_redirect/api/resolve/{fileId}` (który weryfikuje indeks w `oc_memories`
-	 *    i w razie potrzeby indeksuje świeżo wgrany film w locie) i przechodzi pod zwrócony URL Memories.
+	 * Główna funkcja przekierowująca wybrany plik do Memories.
 	 */
 	async function redirectToMemories(options) {
 		const fileId = options && options.fileId ? parseInt(String(options.fileId), 10) : null;
@@ -315,11 +561,9 @@
 		const name = options.name || '';
 		const mtime = options.mtime || null;
 
-		// 1. Natychmiast zablokuj domyślny Viewer i wyczyść URL w historii przeglądarki
-		abortDefaultViewerAndVideoDownload();
+		abortDefaultViewerAndMediaDownload();
 		ensureCleanFilesHistoryState(dir);
 
-		// 2. Pobierz docelowy URL z backendu (zapewnia indeksację w locie w oc_memories)
 		const queryParams = new URLSearchParams();
 		if (dir) {
 			queryParams.set('dir', dir);
@@ -331,6 +575,7 @@
 		const resolveUrl = getWebRootUrl('/apps/' + APP_ID + '/api/resolve/' + encodeURIComponent(String(fileId)))
 			+ (queryParams.toString() ? '?' + queryParams.toString() : '');
 
+		let backendReturnedHttpError = false;
 		try {
 			const headers = {
 				'Accept': 'application/json',
@@ -361,41 +606,42 @@
 					window.location.assign(data.url);
 					return true;
 				}
+			} else if (response && response.status >= 400) {
+				backendReturnedHttpError = true;
 			}
 		} catch (_) {
-			// W razie błędu sieciowego przejdź do bezpośredniego endpointu przekierowującego
+			// Błąd sieciowy lub timeout — spróbuj przekierowania bezpośredniego lub fallbacku Memories
 		}
 
-		// 3. Fallback: bezpośredni endpoint HTTP 302 `/apps/memories_video_redirect/open/{fileId}`
-		// lub bezpośredni URL do widoku katalogu w Memories
-		try {
-			const directOpenUrl = getWebRootUrl('/apps/' + APP_ID + '/open/' + encodeURIComponent(String(fileId)))
-				+ (queryParams.toString() ? '?' + queryParams.toString() : '');
-			ensureCleanFilesHistoryState(dir);
-			window.location.assign(directOpenUrl);
-			return true;
-		} catch (_) {
-			const dayId = computeFallbackDayId(mtime);
-			const cleanRelDir = String(dir || '/').replace(/^\/+|\/+$/g, '');
-			const encodedDir = cleanRelDir
-				? cleanRelDir.split('/').map(encodeURIComponent).join('/')
-				: '';
-			const fallbackMemoriesUrl = getWebRootUrl('/apps/memories/folders/' + encodedDir)
-				+ '?sort=timeline&noinit=1#v/' + dayId + '/' + fileId;
-			window.location.assign(fallbackMemoriesUrl);
-			return true;
+		if (!backendReturnedHttpError) {
+			try {
+				const directOpenUrl = getWebRootUrl('/apps/' + APP_ID + '/open/' + encodeURIComponent(String(fileId)))
+					+ (queryParams.toString() ? '?' + queryParams.toString() : '');
+				ensureCleanFilesHistoryState(dir);
+				window.location.assign(directOpenUrl);
+				return true;
+			} catch (_) {
+				// Przejdź do bezpośredniego adresu Memories poniżej
+			}
 		}
+
+		const dayId = computeFallbackDayId(mtime);
+		const cleanRelDir = String(dir || '/').replace(/^\/+|\/+$/g, '');
+		const encodedDir = cleanRelDir
+			? cleanRelDir.split('/').map(encodeURIComponent).join('/')
+			: '';
+		const fallbackMemoriesUrl = getWebRootUrl('/apps/memories/folders/' + encodedDir)
+			+ '?sort=timeline&noinit=1#v/' + dayId + '/' + fileId;
+		ensureCleanFilesHistoryState(dir);
+		window.location.assign(fallbackMemoriesUrl);
+		return true;
 	}
 
 	// =========================================================================
 	// POZIOM 1: Rejestr akcji `@nextcloud/files` (v3 i v4), `OCA.Files.fileActions`
-	//           oraz blokada `OCA.Viewer` dla plików wideo
+	//           oraz blokada `OCA.Viewer`
 	// =========================================================================
 
-	/**
-	 * Normalizuje argumenty wywołania `enabled(...)` pomiędzy `@nextcloud/files` v3 `(nodes, view)`
-	 * a `@nextcloud/files` v4 `({ nodes, view, folder, contents })`.
-	 */
 	function extractNodesFromActionArgs(arg1) {
 		if (Array.isArray(arg1)) {
 			return arg1;
@@ -411,10 +657,6 @@
 		return [];
 	}
 
-	/**
-	 * Normalizuje argumenty wywołania `exec(...)` pomiędzy `@nextcloud/files` v3 `(node, view, dir)`
-	 * a `@nextcloud/files` v4 `({ nodes, view, folder, contents })`.
-	 */
 	function extractSingleNodeAndDirFromExecArgs(arg1, arg2, arg3) {
 		if (arg1 && typeof arg1 === 'object' && Array.isArray(arg1.nodes)) {
 			const node = arg1.nodes[0] || null;
@@ -428,30 +670,46 @@
 		return { node: arg1 || null, dir: extractCurrentDir(arg1, arg3) };
 	}
 
-	/**
-	 * Tworzy obiekt akcji kompatybilny zarówno z `@nextcloud/files` v3 (`FileAction`),
-	 * jak i `@nextcloud/files` v4 (`IFileAction`).
-	 */
+	function syncActionPriorityProps(actionConfig) {
+		if (!actionConfig) {
+			return;
+		}
+		const target = actionConfig._action && typeof actionConfig._action === 'object' ? actionConfig._action : actionConfig;
+		if (runtimeConfig.interceptDefaultClick) {
+			target.default = 'default';
+			target.order = -1000;
+		} else {
+			target.default = undefined;
+			target.order = 10;
+		}
+	}
+
 	function createMemoriesFileActionObject() {
+		const resolveLabel = function (arg1) {
+			const nodes = extractNodesFromActionArgs(arg1);
+			const mediaType = nodes.length === 1 ? classifyNode(nodes[0]) : null;
+			return getActionLabel(mediaType);
+		};
+
 		const actionConfig = {
 			id: ACTION_ID,
-			displayName: function () {
-				return getActionLabel();
+			displayName: function (arg1) {
+				return resolveLabel(arg1);
 			},
-			title: function () {
-				return getActionLabel();
+			title: function (arg1) {
+				return resolveLabel(arg1);
 			},
 			iconSvgInline: function () {
 				return PLAY_ICON_SVG;
 			},
-			default: 'default',
-			order: -1000,
+			default: runtimeConfig.interceptDefaultClick ? 'default' : undefined,
+			order: runtimeConfig.interceptDefaultClick ? -1000 : 10,
 			enabled: function (arg1) {
 				const nodes = extractNodesFromActionArgs(arg1);
 				if (!nodes || nodes.length !== 1) {
 					return false;
 				}
-				return isVideoNode(nodes[0]);
+				return isTargetNode(nodes[0]);
 			},
 			exec: async function (arg1, arg2, arg3) {
 				const extracted = extractSingleNodeAndDirFromExecArgs(arg1, arg2, arg3);
@@ -473,18 +731,10 @@
 			}
 		};
 
-		// Dodaj pole `_action`, z którego korzystają gettery klasy `FileAction` w @nextcloud/files v3
 		actionConfig._action = actionConfig;
 		return actionConfig;
 	}
 
-	/**
-	 * Modyfikuje istniejącą akcję `view` / `viewer` z aplikacji `viewer`, tak aby:
-	 * 1. Nie była aktywna (`enabled` -> `false`) dla pojedynczych plików wideo (dzięki czemu
-	 *    nasza akcja `memories-video-redirect` jest jedyną domyślną akcją dla wideo).
-	 * 2. Nawet gdyby została wywołana bezpośrednio na pliku wideo, przekierowała do Memories
-	 *    zamiast otwierać `OCA.Viewer.open`.
-	 */
 	function patchExistingViewerFileAction(actionObj) {
 		if (!actionObj || actionObj.__memoriesPatched) {
 			return;
@@ -495,7 +745,7 @@
 
 		const wrappedEnabled = function (arg1, arg2) {
 			const nodes = extractNodesFromActionArgs(arg1);
-			if (nodes.length > 0 && nodes.every(isVideoNode)) {
+			if (nodes.length > 0 && nodes.every(isAutoRedirectNode)) {
 				return false;
 			}
 			return origEnabled ? origEnabled(arg1, arg2) : true;
@@ -503,7 +753,7 @@
 
 		const wrappedExec = async function (arg1, arg2, arg3) {
 			const extracted = extractSingleNodeAndDirFromExecArgs(arg1, arg2, arg3);
-			if (extracted.node && isVideoNode(extracted.node)) {
+			if (extracted.node && isAutoRedirectNode(extracted.node)) {
 				const fileId = extractFileIdFromNode(extracted.node);
 				if (fileId) {
 					await redirectToMemories({
@@ -543,10 +793,39 @@
 		actionObj.__memoriesPatched = true;
 	}
 
-	/**
-	 * Rejestruje akcję w globalnym rejestrze `@nextcloud/files` (zarówno v4 `window._nc_files_scope`,
-	 * jak i v3 `window._nc_fileactions`) oraz w klasycznym `window.OCA.Files.fileActions`.
-	 */
+	function registerLegacyActionForMime(legacyActions, actionId, mimeKey, mediaType) {
+		if (!legacyActions || typeof legacyActions.registerAction !== 'function') {
+			return;
+		}
+		legacyActions.registerAction({
+			name: actionId,
+			displayName: getActionLabel(mediaType),
+			mime: mimeKey,
+			permissions: (window.OC && window.OC.PERMISSION_READ) ? window.OC.PERMISSION_READ : 1,
+			iconClass: mediaType === 'video' ? 'icon-play' : 'icon-picture',
+			actionHandler: function (fileName, context) {
+				let fileId = null;
+				let dir = '/';
+				if (context) {
+					if (context.$file && typeof context.$file.attr === 'function') {
+						fileId = parseInt(context.$file.attr('data-id') || context.$file.attr('data-cy-files-list-row-fileid') || '0', 10);
+					}
+					if (context.fileActions && typeof context.fileActions.getCurrentDirectory === 'function') {
+						dir = context.fileActions.getCurrentDirectory();
+					} else if (typeof context.dir === 'string') {
+						dir = context.dir;
+					}
+				}
+				if (fileId) {
+					redirectToMemories({ fileId: fileId, dir: dir, name: fileName });
+				}
+			}
+		});
+		if (runtimeConfig.interceptDefaultClick && typeof legacyActions.setDefault === 'function') {
+			legacyActions.setDefault(mimeKey, actionId);
+		}
+	}
+
 	function registerAndPatchFileActions() {
 		const memoriesAction = createMemoriesFileActionObject();
 
@@ -557,14 +836,12 @@
 					return;
 				}
 
-				// Zpatchuj domyślną akcję `view` / `viewer` jeśli jest już zarejestrowana
 				['view', 'viewer'].forEach(function (viewerId) {
 					if (scope.fileActions.has(viewerId)) {
 						patchExistingViewerFileAction(scope.fileActions.get(viewerId));
 					}
 				});
 
-				// Zarejestruj naszą akcję jako domyślną (z order: -1000)
 				if (!scope.fileActions.has(ACTION_ID)) {
 					scope.fileActions.set(ACTION_ID, memoriesAction);
 					if (scope.registry && typeof scope.registry.dispatchEvent === 'function') {
@@ -574,6 +851,8 @@
 							// Ignoruj
 						}
 					}
+				} else {
+					syncActionPriorityProps(scope.fileActions.get(ACTION_ID));
 				}
 			});
 		}
@@ -586,56 +865,46 @@
 			if (existing && (existing.id === 'view' || existing.id === 'viewer')) {
 				patchExistingViewerFileAction(existing);
 			}
+			if (existing && existing.id === ACTION_ID) {
+				syncActionPriorityProps(existing);
+			}
 		});
 		if (!window._nc_fileactions.some(function (a) { return a && a.id === ACTION_ID; })) {
 			window._nc_fileactions.unshift(memoriesAction);
 		}
 
-		// 3. Obsługa klasycznego `window.OCA.Files.fileActions` (starsze widoki / wtyczki)
+		// 3. Obsługa klasycznego `window.OCA.Files.fileActions`
 		try {
 			const legacyActions = window.OCA && window.OCA.Files && window.OCA.Files.fileActions;
-			if (legacyActions && typeof legacyActions.registerAction === 'function' && !legacyActions.__memoriesVideoRegistered) {
-				legacyActions.registerAction({
-					name: ACTION_ID,
-					displayName: getActionLabel(),
-					mime: 'video',
-					permissions: (window.OC && window.OC.PERMISSION_READ) ? window.OC.PERMISSION_READ : 1,
-					iconClass: 'icon-play',
-					actionHandler: function (fileName, context) {
-						let fileId = null;
-						let dir = '/';
-						if (context) {
-							if (context.$file && typeof context.$file.attr === 'function') {
-								fileId = parseInt(context.$file.attr('data-id') || context.$file.attr('data-cy-files-list-row-fileid') || '0', 10);
-							}
-							if (context.fileActions && typeof context.fileActions.getCurrentDirectory === 'function') {
-								dir = context.fileActions.getCurrentDirectory();
-							} else if (typeof context.dir === 'string') {
-								dir = context.dir;
-							}
-						}
-						if (fileId) {
-							redirectToMemories({ fileId: fileId, dir: dir, name: fileName });
-						}
-					}
-				});
-				if (typeof legacyActions.setDefault === 'function') {
-					legacyActions.setDefault('video', ACTION_ID);
+			if (legacyActions && typeof legacyActions.registerAction === 'function') {
+				if (runtimeConfig.redirectVideos && !legacyActions.__memoriesVideoRegistered) {
+					registerLegacyActionForMime(legacyActions, ACTION_ID, 'video', 'video');
+					legacyActions.__memoriesVideoRegistered = true;
 				}
-				legacyActions.__memoriesVideoRegistered = true;
+				if (runtimeConfig.redirectPhotos && !legacyActions.__memoriesImageRegistered) {
+					registerLegacyActionForMime(legacyActions, LEGACY_IMAGE_ACTION_ID, 'image', 'photo');
+					legacyActions.__memoriesImageRegistered = true;
+				}
 			}
 		} catch (_) {
 			// Ignoruj błędy legacy API
 		}
 	}
 
+	function hasExcludedExtensionIn(extensionSet) {
+		if (!runtimeConfig.excludedExtensions || runtimeConfig.excludedExtensions.size === 0) {
+			return false;
+		}
+		for (const ext of runtimeConfig.excludedExtensions) {
+			if (extensionSet.has(ext)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/**
-	 * Blokuje obsługę plików `video/*` bezpośrednio w serwisie `window.OCA.Viewer`:
-	 * 1. Usuwa typy `video/*` z `OCA.Viewer._mimetypes` oraz handler `'videos'` z `OCA.Viewer._state.handlers`
-	 *    (dzięki czemu `viewerAction` sam uznaje pliki wideo za nieobsługiwane i nie ładuje ich też przy
-	 *    przewijaniu zdjęć Prawo/Lewo w podglądzie obrazów!).
-	 * 2. Opakowuje `OCA.Viewer.open`, aby każda bezpośrednia próba otwarcia wideo w Viewerze została
-	 *    natychmiast przerwana przed utworzeniem tagu `<video>` i przekierowana do Memories.
+	 * Blokuje obsługę przekierowywanych typów mediów bezpośrednio w serwisie `window.OCA.Viewer`.
 	 */
 	function patchOCAViewerService() {
 		const viewer = window.OCA && window.OCA.Viewer;
@@ -643,26 +912,47 @@
 			return;
 		}
 
-		// 1. Usuń typy MIME wideo z listy obsługiwanych przez OCA.Viewer
-		try {
-			if (Array.isArray(viewer._mimetypes)) {
-				for (let i = viewer._mimetypes.length - 1; i >= 0; i--) {
-					const m = String(viewer._mimetypes[i] || '').toLowerCase();
-					if (m.startsWith('video/') || EXTRA_VIDEO_MIMES.has(m)) {
-						viewer._mimetypes.splice(i, 1);
+		// 1. Usuń obsługiwane typy MIME z OCA.Viewer (jeśli opcja blockDefaultViewer jest aktywna
+		//    i nie zdefiniowano wykluczonych katalogów, które nadal muszą otwierać pliki w Viewerze)
+		const hasExcludedPaths = Array.isArray(runtimeConfig.excludedPaths) && runtimeConfig.excludedPaths.length > 0;
+		if (runtimeConfig.blockDefaultViewer && runtimeConfig.interceptDefaultClick && !hasExcludedPaths) {
+			try {
+				if (Array.isArray(viewer._mimetypes)) {
+					for (let i = viewer._mimetypes.length - 1; i >= 0; i--) {
+						const m = String(viewer._mimetypes[i] || '').toLowerCase();
+						if (classifyFileByMimeOrName(m, '') !== null) {
+							viewer._mimetypes.splice(i, 1);
+						}
 					}
 				}
-			}
-			if (viewer._state && Array.isArray(viewer._state.handlers)) {
-				for (let i = viewer._state.handlers.length - 1; i >= 0; i--) {
-					const h = viewer._state.handlers[i];
-					if (h && h.id === 'videos') {
-						viewer._state.handlers.splice(i, 1);
+				if (viewer._state && Array.isArray(viewer._state.handlers)) {
+					const videoExclusions = hasExcludedExtensionIn(VIDEO_EXTENSIONS);
+					const imageExclusions = hasExcludedExtensionIn(IMAGE_EXTENSIONS);
+					for (let i = viewer._state.handlers.length - 1; i >= 0; i--) {
+						const h = viewer._state.handlers[i];
+						if (!h) {
+							continue;
+						}
+						if (Array.isArray(h.mimes) && h.mimes.length > 0) {
+							for (let j = h.mimes.length - 1; j >= 0; j--) {
+								const hm = String(h.mimes[j] || '').toLowerCase();
+								if (classifyFileByMimeOrName(hm, '') !== null) {
+									h.mimes.splice(j, 1);
+								}
+							}
+							if (h.mimes.length === 0) {
+								viewer._state.handlers.splice(i, 1);
+							}
+						} else if (h.id === 'videos' && runtimeConfig.redirectVideos && !videoExclusions) {
+							viewer._state.handlers.splice(i, 1);
+						} else if (h.id === 'images' && runtimeConfig.redirectPhotos && !imageExclusions) {
+							viewer._state.handlers.splice(i, 1);
+						}
 					}
 				}
+			} catch (_) {
+				// Ignoruj
 			}
-		} catch (_) {
-			// Ignoruj
 		}
 
 		// 2. Opakuj metodę `OCA.Viewer.open`
@@ -670,20 +960,22 @@
 			const origOpen = viewer.open.bind(viewer);
 			const wrappedOpen = function (options) {
 				try {
-					const path = (options && options.path) || (typeof options === 'string' ? options : '');
-					const fileInfo = options && options.fileInfo;
-					const mime = (fileInfo && fileInfo.mime) || '';
-					const name = (fileInfo && (fileInfo.basename || fileInfo.filename)) || path || '';
+					if (runtimeConfig.interceptDefaultClick) {
+						const path = (options && options.path) || (typeof options === 'string' ? options : '');
+						const fileInfo = options && options.fileInfo;
+						const mime = (fileInfo && fileInfo.mime) || '';
+						const name = (fileInfo && (fileInfo.basename || fileInfo.filename)) || path || '';
 
-					if (isVideoByMimeOrName(mime, name)) {
-						const infoFromDom = findVideoRowInfoByPathOrName(path, name, fileInfo && fileInfo.fileid);
-						if (infoFromDom && infoFromDom.fileId) {
-							redirectToMemories(infoFromDom);
-							return;
+						if (classifyFileByMimeOrName(mime, name) !== null) {
+							const infoFromDom = findTargetRowInfoByPathOrName(path, name, fileInfo && fileInfo.fileid);
+							if (infoFromDom && infoFromDom.fileId && infoFromDom.shouldAutoRedirect) {
+								redirectToMemories(infoFromDom);
+								return;
+							}
 						}
 					}
 				} catch (_) {
-					// Kontynuuj do origOpen tylko jeśli to nie wideo
+					// Kontynuuj do origOpen
 				}
 				return origOpen.apply(this, arguments);
 			};
@@ -696,10 +988,6 @@
 	// POZIOM 2: Interceptor DOM (kliknięcie w wiersz tabeli) oraz History API
 	// =========================================================================
 
-	/**
-	 * Wyciąga metadane pliku (`fileId`, `name`, `mime`, `dir`, `isVideo`) z wiersza tabeli DOM
-	 * (`tr[data-cy-files-list-row]`, `.files-list__row` lub `.files-grid__item`).
-	 */
 	function extractRowFileInfo(rowEl) {
 		if (!rowEl || !(rowEl instanceof Element)) {
 			return null;
@@ -713,13 +1001,17 @@
 			if (vueSource && typeof vueSource === 'object') {
 				const vueFileId = extractFileIdFromNode(vueSource);
 				if (vueFileId) {
+					const dir = extractCurrentDir(vueSource);
+					const mediaType = classifyNode(vueSource);
 					return {
 						fileId: vueFileId,
 						name: vueSource.basename || vueSource.name || '',
 						mime: vueSource.mime || vueSource.mimetype || '',
-						dir: extractCurrentDir(vueSource),
+						dir: dir,
 						mtime: vueSource.mtime || null,
-						isVideo: isVideoNode(vueSource)
+						mediaType: mediaType,
+						isTarget: mediaType !== null,
+						shouldAutoRedirect: mediaType !== null && runtimeConfig.interceptDefaultClick && !isPathExcluded(dir)
 					};
 				}
 			}
@@ -727,7 +1019,7 @@
 			// Kontynuuj do atrybutów DOM
 		}
 
-		// 2. Odczytaj z atrybutów `data-*` wiersza tabeli w nowym Nextcloud Files (Vue) oraz starszym widoku
+		// 2. Odczytaj z atrybutów `data-*` wiersza tabeli
 		const rawId = rowEl.getAttribute('data-cy-files-list-row-fileid')
 			|| rowEl.getAttribute('data-id')
 			|| rowEl.getAttribute('data-fileid')
@@ -762,20 +1054,22 @@
 			|| rowEl.classList.contains('files-list__row--folder')
 			|| mime === 'httpd/unix-directory';
 
+		const dir = extractCurrentDir(null);
+		const mediaType = isFolder ? null : classifyFileByMimeOrName(mime, name);
+
 		return {
 			fileId: fileId,
 			name: name,
 			mime: mime,
-			dir: extractCurrentDir(null),
+			dir: dir,
 			mtime: null,
-			isVideo: !isFolder && isVideoByMimeOrName(mime, name)
+			mediaType: mediaType,
+			isTarget: mediaType !== null,
+			shouldAutoRedirect: mediaType !== null && runtimeConfig.interceptDefaultClick && !isPathExcluded(dir)
 		};
 	}
 
-	/**
-	 * Wyszukuje informacje o pliku wideo w aktualnie wyrenderowanym DOM po `fileId` lub ścieżce/nazwie.
-	 */
-	function findVideoRowInfoByPathOrName(path, name, explicitFileId) {
+	function findTargetRowInfoByPathOrName(path, name, explicitFileId) {
 		if (explicitFileId) {
 			const byId = findRowInfoByFileId(explicitFileId);
 			if (byId) {
@@ -784,23 +1078,21 @@
 		}
 
 		const targetBase = (name || path || '').split('/').pop();
-		const rows = document.querySelectorAll('tr[data-cy-files-list-row], tr[data-id], .files-list__row');
+		const rows = document.querySelectorAll('tr[data-cy-files-list-row], tr[data-id], .files-list__row, .files-grid__item');
 		for (let i = 0; i < rows.length; i++) {
 			const info = extractRowFileInfo(rows[i]);
-			if (info && info.isVideo && (!targetBase || info.name === targetBase)) {
+			if (info && info.isTarget && (!targetBase || info.name === targetBase)) {
 				return info;
 			}
 		}
 		return null;
 	}
 
-	/**
-	 * Wyszukuje informacje o wierszu pliku w DOM na podstawie `fileId`.
-	 */
 	function findRowInfoByFileId(fileId) {
 		const idStr = String(fileId);
 		const selector = 'tr[data-cy-files-list-row-fileid="' + idStr + '"], '
 			+ '[data-cy-files-list-row][data-cy-files-list-row-fileid="' + idStr + '"], '
+			+ '.files-grid__item[data-cy-files-list-row-fileid="' + idStr + '"], '
 			+ 'tr[data-id="' + idStr + '"]';
 		const rowEl = document.querySelector(selector);
 		if (rowEl) {
@@ -809,10 +1101,6 @@
 		return null;
 	}
 
-	/**
-	 * Sprawdza, czy kliknięty element wewnątrz wiersza pliku powinien otworzyć plik,
-	 * czy jest to np. checkbox zaznaczania, menu akcji `...`, przycisk ulubionych lub udostępniania.
-	 */
 	function isInteractiveControlClick(targetEl, rowEl) {
 		if (!targetEl || !(targetEl instanceof Element)) {
 			return true;
@@ -833,13 +1121,11 @@
 
 		const matchedControl = targetEl.closest(ignoredSelectors);
 		if (matchedControl && rowEl.contains(matchedControl)) {
-			// Pozwól na kliknięcie w sam główny link nazwy pliku (<a class="files-list__row-name-link"> lub <button>)
 			if (
 				matchedControl.classList.contains('files-list__row-name')
 				|| matchedControl.hasAttribute('data-cy-files-list-row-name')
 				|| matchedControl.closest('[data-cy-files-list-row-name], .files-list__row-name, .files-list__row-icon')
 			) {
-				// Sprawdź, czy to nie jest przycisk wewnątrz sekcji akcji (np. "...")
 				if (!targetEl.closest('[data-cy-files-list-row-actions], .files-list__row-actions')) {
 					return false;
 				}
@@ -849,11 +1135,10 @@
 		return false;
 	}
 
-	/**
-	 * Nasłuchiwanie kliknięć w fazie `capture` (zanim zdarzenie dotrze do komponentu Vue `FileEntry.vue` lub `viewer`).
-	 */
 	function onDocumentClickCapture(event) {
-		// Ignoruj kliknięcia z klawiszami modyfikującymi (zaznaczanie wielu plików) oraz kliknięcia inne niż lewy przycisk myszy
+		if (!runtimeConfig.interceptDefaultClick) {
+			return;
+		}
 		if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) {
 			return;
 		}
@@ -863,7 +1148,6 @@
 			return;
 		}
 
-		// Ignoruj kliknięcia wewnątrz otwartego menu kontekstowego (tam działa nasza jawna akcja "Odtwórz w Memories")
 		if (target.closest('.v-popper__popper, .open-menu, #aca-menu')) {
 			return;
 		}
@@ -877,7 +1161,6 @@
 			return;
 		}
 
-		// Upewnij się, że kliknięto w komórkę nazwy, ikony/miniatury lub główny obszar wiersza
 		const clickedOpenArea = target.closest(
 			'[data-cy-files-list-row-name], .files-list__row-name, .files-list__row-icon, .nametext, .thumbnail, .files-grid__item'
 		);
@@ -886,11 +1169,10 @@
 		}
 
 		const info = extractRowFileInfo(rowEl);
-		if (!info || !info.isVideo || !info.fileId) {
+		if (!info || !info.shouldAutoRedirect || !info.fileId) {
 			return;
 		}
 
-		// Zablokuj natychmiast otwarcie domyślnego Viewera i pobieranie pliku przez WebDAV!
 		event.preventDefault();
 		event.stopPropagation();
 		if (typeof event.stopImmediatePropagation === 'function') {
@@ -900,13 +1182,8 @@
 		redirectToMemories(info);
 	}
 
-	/**
-	 * Analizuje URL przekazywany do `history.pushState` / `history.replaceState` lub obecny w `window.location`.
-	 * Jeśli zawiera parametr `openfile` dla pliku wideo:
-	 * - zwraca informacje o pliku wideo oraz czysty adres URL katalogu (bez `openfile` i bez `/<fileid>`).
-	 */
-	function inspectUrlForVideoOpenFile(rawUrl) {
-		if (!rawUrl) {
+	function inspectUrlForTargetOpenFile(rawUrl) {
+		if (!rawUrl || !runtimeConfig.interceptDefaultClick) {
 			return null;
 		}
 		try {
@@ -923,7 +1200,6 @@
 				return null;
 			}
 
-			// Wyciągnij fileId ze ścieżki `/apps/files/<view>/<fileid>` lub z `?openfile=<fileid>`
 			let fileId = null;
 			const pathMatch = parsed.pathname.match(/\/apps\/files\/[^/]+\/(\d+)\/?$/);
 			if (pathMatch && pathMatch[1]) {
@@ -943,11 +1219,15 @@
 			}
 
 			const rowInfo = findRowInfoByFileId(fileId);
-			if (!rowInfo || !rowInfo.isVideo) {
+			if (!rowInfo || !rowInfo.shouldAutoRedirect) {
 				return null;
 			}
 
-			// Zbuduj czysty URL katalogu (bez `openfile`, bez `editing` i bez `/<fileid>` w ścieżce)
+			const dir = parsed.searchParams.get('dir') || rowInfo.dir || '/';
+			if (isPathExcluded(dir)) {
+				return null;
+			}
+
 			const cleanUrl = new URL(parsed.toString());
 			cleanUrl.searchParams.delete('openfile');
 			cleanUrl.searchParams.delete('editing');
@@ -955,7 +1235,7 @@
 
 			return {
 				fileId: fileId,
-				dir: parsed.searchParams.get('dir') || rowInfo.dir || '/',
+				dir: dir,
 				name: rowInfo.name || '',
 				mtime: rowInfo.mtime || null,
 				cleanUrl: cleanUrl.toString()
@@ -965,16 +1245,12 @@
 		}
 	}
 
-	/**
-	 * Instaluje interceptor na `window.history.pushState` oraz `window.history.replaceState`.
-	 */
 	function installHistoryInterceptors() {
 		window.history.pushState = function (state, title, url) {
-			const match = inspectUrlForVideoOpenFile(url);
+			const match = inspectUrlForTargetOpenFile(url);
 			if (match) {
-				// Zamiast odkładać wpis z `?openfile=true`, zachowaj czysty URL katalogu w bieżącym wpisie historii
 				originalReplaceState(state, title, match.cleanUrl);
-				abortDefaultViewerAndVideoDownload();
+				abortDefaultViewerAndMediaDownload();
 				redirectToMemories(match);
 				return;
 			}
@@ -982,10 +1258,10 @@
 		};
 
 		window.history.replaceState = function (state, title, url) {
-			const match = inspectUrlForVideoOpenFile(url);
+			const match = inspectUrlForTargetOpenFile(url);
 			if (match) {
 				originalReplaceState(state, title, match.cleanUrl);
-				abortDefaultViewerAndVideoDownload();
+				abortDefaultViewerAndMediaDownload();
 				redirectToMemories(match);
 				return;
 			}
@@ -993,27 +1269,20 @@
 		};
 	}
 
-	/**
-	 * Obsługa sytuacji, w której użytkownik otworzył bezpośrednio link z `?openfile=true`
-	 * wskazujący na plik wideo (np. z wyszukiwarki Nextcloud lub zakładki).
-	 */
-	function checkInitialUrlForVideoOpenFile() {
+	function checkInitialUrlForTargetOpenFile() {
 		if (!window.location.search.includes('openfile')) {
 			return;
 		}
-		const match = inspectUrlForVideoOpenFile(window.location.href);
+		const match = inspectUrlForTargetOpenFile(window.location.href);
 		if (match) {
 			originalReplaceState(window.history.state, document.title, match.cleanUrl);
-			abortDefaultViewerAndVideoDownload();
+			abortDefaultViewerAndMediaDownload();
 			redirectToMemories(match);
 		}
 	}
 
-	/**
-	 * Inicjalizacja wszystkich warstw przechwytywania oraz obserwatora zmian (gdy `viewer`
-	 * lub `@nextcloud/files` doładują swoje skrypty asynchronicznie po naszym skrypcie).
-	 */
 	function init() {
+		refreshRuntimeConfigFromInitialState();
 		registerAndPatchFileActions();
 		patchOCAViewerService();
 		installHistoryInterceptors();
@@ -1021,12 +1290,11 @@
 		document.addEventListener('click', onDocumentClickCapture, true);
 		document.addEventListener('dblclick', onDocumentClickCapture, true);
 
-		// Powtórz rejestrację i patchowanie po załadowaniu DOM oraz krótkim opóźnieniu,
-		// na wypadek gdyby aplikacja `viewer` zarejestrowała swoją akcję `view` po naszym skrypcie.
 		const syncHooks = function () {
+			refreshRuntimeConfigFromInitialState();
 			registerAndPatchFileActions();
 			patchOCAViewerService();
-			checkInitialUrlForVideoOpenFile();
+			checkInitialUrlForTargetOpenFile();
 		};
 
 		if (document.readyState === 'loading') {
@@ -1039,7 +1307,6 @@
 		setTimeout(syncHooks, 300);
 		setTimeout(syncHooks, 1200);
 
-		// Obserwuj pojawienie się wierszy tabeli w przypadku leniwego renderowania listy plików
 		if (typeof MutationObserver !== 'undefined') {
 			let debounceTimer = null;
 			const observer = new MutationObserver(function () {
@@ -1048,10 +1315,11 @@
 				}
 				debounceTimer = setTimeout(function () {
 					debounceTimer = null;
+					refreshRuntimeConfigFromInitialState();
 					registerAndPatchFileActions();
 					patchOCAViewerService();
 					if (window.location.search.includes('openfile')) {
-						checkInitialUrlForVideoOpenFile();
+						checkInitialUrlForTargetOpenFile();
 					}
 				}, 150);
 			});

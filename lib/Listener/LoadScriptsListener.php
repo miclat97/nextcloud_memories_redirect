@@ -7,10 +7,11 @@ namespace OCA\MemoriesVideoRedirect\Listener;
 use OCA\Files\Event\LoadAdditionalScriptsEvent;
 use OCA\MemoriesVideoRedirect\AppInfo\Application;
 use OCA\MemoriesVideoRedirect\Controller\RedirectController;
+use OCA\MemoriesVideoRedirect\Service\ConfigService;
 use OCP\AppFramework\Http\Events\BeforeTemplateRenderedEvent;
-use OCP\AppFramework\Services\IInitialState;
 use OCP\EventDispatcher\Event;
 use OCP\EventDispatcher\IEventListener;
+use OCP\IInitialStateService;
 use OCP\IRequest;
 use OCP\Util;
 
@@ -19,11 +20,13 @@ use OCP\Util;
  */
 class LoadScriptsListener implements IEventListener {
 	private static bool $scriptAdded = false;
+	private static bool $configStateAdded = false;
 
 	public function __construct(
 		private IRequest $request,
-		private IInitialState $initialState,
+		private IInitialStateService $initialState,
 		private RedirectController $redirectController,
+		private ConfigService $configService,
 	) {
 	}
 
@@ -49,16 +52,25 @@ class LoadScriptsListener implements IEventListener {
 				$this->addRedirectScript();
 			}
 
-			// 2. Tryb awaryjny (fallback) dla plików wideo spoza skonfigurowanego foldersPath w Memories
+			// 2. Tryb awaryjny (fallback) dla plików spoza skonfigurowanego foldersPath w Memories
 			// lub plików, których exiftool nie zdołał zapisać w oc_memories:
 			// wstrzykujemy stan początkowy `single_item` bezpośrednio do widoku Memories.
-			$rawFileId = $this->request->getParam('memories_video_fileid');
-			if ($rawFileId !== null && ctype_digit((string) $rawFileId)) {
+			$rawFileId = $this->request->getParam('memories_redirect_fileid')
+				?? $this->request->getParam('memories_video_fileid');
+			if (
+				$rawFileId !== null
+				&& ctype_digit((string) $rawFileId)
+				&& $this->configService->isSingleItemFallbackEnabled()
+			) {
 				$fileId = (int) $rawFileId;
 				if ($fileId > 0) {
 					$singleItem = $this->redirectController->buildSingleItemPayload($fileId);
 					if ($singleItem !== null) {
-						$this->initialState->provideInitialState('memories', 'single_item', $singleItem);
+						try {
+							$this->initialState->provideInitialState('memories', 'single_item', $singleItem);
+						} catch (\Throwable $e) {
+							// Ignoruj błędy stanu początkowego
+						}
 					}
 					$this->addRedirectScript();
 				}
@@ -67,6 +79,18 @@ class LoadScriptsListener implements IEventListener {
 	}
 
 	private function addRedirectScript(): void {
+		if (!self::$configStateAdded) {
+			self::$configStateAdded = true;
+			try {
+				$this->initialState->provideInitialState(
+					Application::APP_ID,
+					'config',
+					$this->configService->getFrontendConfig()
+				);
+			} catch (\Throwable $e) {
+				// Ignoruj błędy stanu początkowego — frontend użyje domyślnej konfiguracji
+			}
+		}
 		if (self::$scriptAdded) {
 			return;
 		}

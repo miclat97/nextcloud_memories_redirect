@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\MemoriesVideoRedirect\Controller;
 
 use OCA\MemoriesVideoRedirect\AppInfo\Application;
+use OCA\MemoriesVideoRedirect\Service\ConfigService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
@@ -32,13 +33,14 @@ class RedirectController extends Controller {
 		private IConfig $config,
 		private IURLGenerator $urlGenerator,
 		private LoggerInterface $logger,
+		private ConfigService $configService,
 	) {
 		parent::__construct(Application::APP_ID, $request);
 	}
 
 	/**
-	 * Endpoint JSON: weryfikuje indeksację pliku wideo w Memories (w razie potrzeby
-	 * wywołuje wewnętrzny indekser Memories w locie) i zwraca docelowy URL odtwarzacza.
+	 * Endpoint JSON: weryfikuje indeksację pliku w Memories (w razie potrzeby
+	 * wywołuje wewnętrzny indekser Memories w locie) i zwraca docelowy URL w Memories.
 	 *
 	 * @NoAdminRequired
 	 * @NoCSRFRequired
@@ -47,11 +49,11 @@ class RedirectController extends Controller {
 	#[NoCSRFRequired]
 	public function resolve(int $fileId, ?string $dir = null, ?string $name = null): JSONResponse {
 		try {
-			$result = $this->resolveVideoTarget($fileId, $dir, $name);
+			$result = $this->resolveTarget($fileId, $dir, $name);
 			return new JSONResponse($result, Http::STATUS_OK);
 		} catch (NotFoundException $e) {
 			return new JSONResponse([
-				'error' => 'Nie znaleziono pliku wideo.',
+				'error' => 'Nie znaleziono pliku.',
 				'fileId' => $fileId,
 			], Http::STATUS_NOT_FOUND);
 		} catch (\Throwable $e) {
@@ -74,7 +76,7 @@ class RedirectController extends Controller {
 
 	/**
 	 * Endpoint bezpośredniego przekierowania HTTP 302: indeksuje plik w locie (jeśli trzeba)
-	 * i od razu przekierowuje przeglądarkę do odtwarzacza w Memories.
+	 * i od razu przekierowuje przeglądarkę do Memories.
 	 *
 	 * @NoAdminRequired
 	 * @NoCSRFRequired
@@ -83,7 +85,7 @@ class RedirectController extends Controller {
 	#[NoCSRFRequired]
 	public function open(int $fileId, ?string $dir = null, ?string $name = null): RedirectResponse {
 		try {
-			$result = $this->resolveVideoTarget($fileId, $dir, $name);
+			$result = $this->resolveTarget($fileId, $dir, $name);
 			return new RedirectResponse($result['url']);
 		} catch (\Throwable $e) {
 			$this->logger->warning('Przekierowanie awaryjne do Memories dla fileId=' . $fileId . ': ' . $e->getMessage(), [
@@ -135,7 +137,10 @@ class RedirectController extends Controller {
 		}
 
 		$row = $this->queryMemoriesRow($fileId);
-		if ($row === null || (int) ($row['orphan'] ?? 0) !== 0) {
+		if (
+			$this->configService->isOnTheFlyIndexingEnabled()
+			&& ($row === null || (int) ($row['orphan'] ?? 0) !== 0)
+		) {
 			$this->indexFileInMemoriesOnTheFly($file);
 			$row = $this->queryMemoriesRow($fileId);
 		}
@@ -145,14 +150,16 @@ class RedirectController extends Controller {
 			? (int) $row['dayid']
 			: (int) floor(($mtime > 0 ? $mtime : time()) / 86400);
 
+		$isVideo = $this->detectIsVideo($file, $row);
+
 		return [
 			'fileid' => $fileId,
 			'dayid' => $dayId,
 			'w' => isset($row['w']) && (int) $row['w'] > 0 ? (int) $row['w'] : 1920,
 			'h' => isset($row['h']) && (int) $row['h'] > 0 ? (int) $row['h'] : 1080,
 			'Simple.LivePhotoFileId' => null,
-			'isvideo' => 1,
-			'video_duration' => isset($row['video_duration']) ? (int) $row['video_duration'] : null,
+			'isvideo' => $isVideo ? 1 : 0,
+			'video_duration' => ($isVideo && isset($row['video_duration'])) ? (int) $row['video_duration'] : null,
 			'flag' => 0,
 			'pano' => 0,
 			'etag' => $file->getEtag(),
@@ -167,12 +174,12 @@ class RedirectController extends Controller {
 
 	/**
 	 * Główna logika: znajduje plik, sprawdza obecność w `oc_memories`, w razie potrzeby
-	 * indeksuje go w locie i wyznacza dokładny URL do odtwarzacza w Memories.
+	 * indeksuje go w locie i wyznacza dokładny URL do Memories.
 	 *
 	 * @return array{url: string, fileId: int, dayId: int, indexed: bool, mode: string, path: string}
 	 * @throws NotFoundException
 	 */
-	private function resolveVideoTarget(int $fileId, ?string $dir, ?string $name): array {
+	private function resolveTarget(int $fileId, ?string $dir, ?string $name): array {
 		$user = $this->userSession->getUser();
 		if ($user === null) {
 			throw new NotFoundException('Brak zalogowanego użytkownika.');
@@ -197,7 +204,7 @@ class RedirectController extends Controller {
 			|| (isset($row['mtime']) && (int) $row['mtime'] > 0 && (int) $row['mtime'] !== $mtime)
 		);
 
-		if ($needsIndexing) {
+		if ($needsIndexing && $this->configService->isOnTheFlyIndexingEnabled()) {
 			$this->indexFileInMemoriesOnTheFly($file);
 			$row = $this->queryMemoriesRow($actualFileId);
 		}
@@ -236,17 +243,57 @@ class RedirectController extends Controller {
 			];
 		}
 
-		// 5. Fallback: jeśli plik leży poza `foldersPath` lub exiftool nie zapisał go w `oc_memories`,
-		//    używamy trybu `single_item` obsługiwanego przez LoadScriptsListener + Memories Timeline.vue
-		$url = $this->buildMemoriesFallbackUrl($actualFileId, $dayId);
+		// 5. Fallback: jeśli plik leży poza `foldersPath` lub exiftool nie zapisał go w `oc_memories`
+		if ($this->configService->isSingleItemFallbackEnabled()) {
+			$url = $this->buildMemoriesFallbackUrl($actualFileId, $dayId);
+			return [
+				'url' => $url,
+				'fileId' => $actualFileId,
+				'dayId' => $dayId,
+				'indexed' => $isIndexed,
+				'mode' => 'single_item',
+				'path' => rtrim($relFolder, '/') . '/' . $file->getName(),
+			];
+		}
+
+		if (str_starts_with($relFolder, $foldersPath)) {
+			$subPath = ltrim(substr($relFolder, strlen($foldersPath)), '/');
+			$subPath = rtrim($subPath, '/');
+			return [
+				'url' => $this->buildMemoriesFolderUrl($subPath, $dayId, $actualFileId),
+				'fileId' => $actualFileId,
+				'dayId' => $dayId,
+				'indexed' => $isIndexed,
+				'mode' => 'folders',
+				'path' => rtrim($relFolder, '/') . '/' . $file->getName(),
+			];
+		}
+
 		return [
-			'url' => $url,
+			'url' => $this->buildMemoriesBaseIndexUrl() . '?sort=timeline&noinit=1#v/' . $dayId . '/' . $actualFileId,
 			'fileId' => $actualFileId,
 			'dayId' => $dayId,
 			'indexed' => $isIndexed,
-			'mode' => 'single_item',
+			'mode' => 'timeline',
 			'path' => rtrim($relFolder, '/') . '/' . $file->getName(),
 		];
+	}
+
+	/**
+	 * Ustala, czy plik jest wideo (na podstawie rekordu oc_memories, typu MIME lub rozszerzenia).
+	 *
+	 * @param array<string, mixed>|null $row
+	 */
+	private function detectIsVideo(File $file, ?array $row): bool {
+		if ($row !== null && isset($row['isvideo'])) {
+			return (int) $row['isvideo'] === 1;
+		}
+		$mime = strtolower((string) $file->getMimeType());
+		if (str_starts_with($mime, 'video/')) {
+			return true;
+		}
+		$ext = strtolower(pathinfo($file->getName(), PATHINFO_EXTENSION));
+		return $ext !== '' && in_array($ext, ConfigService::DEFAULT_VIDEO_EXTENSIONS, true);
 	}
 
 	/**
@@ -372,23 +419,27 @@ class RedirectController extends Controller {
 		return $baseFoldersUrl . $encodedPath . '?sort=timeline&noinit=1#v/' . $dayId . '/' . $fileId;
 	}
 
-	/**
-	 * Buduje awaryjny adres URL do Memories wykorzystujący mechanizm `single_item`:
-	 * `/apps/memories/?sort=timeline&noinit=1&memories_video_fileid=<fileId>#v/<dayId>/<fileId>`
-	 */
-	private function buildMemoriesFallbackUrl(int $fileId, int $dayId): string {
+	private function buildMemoriesBaseIndexUrl(): string {
 		try {
 			$baseIndexUrl = $this->urlGenerator->linkToRoute('memories.Page.index');
 			$qPos = strpos($baseIndexUrl, '?');
 			if ($qPos !== false) {
 				$baseIndexUrl = substr($baseIndexUrl, 0, $qPos);
 			}
-			$baseIndexUrl = rtrim($baseIndexUrl, '/') . '/';
+			return rtrim($baseIndexUrl, '/') . '/';
 		} catch (\Throwable $e) {
-			$baseIndexUrl = '/index.php/apps/memories/';
+			return '/index.php/apps/memories/';
 		}
+	}
 
-		return $baseIndexUrl . '?sort=timeline&noinit=1&memories_video_fileid=' . $fileId . '#v/' . $dayId . '/' . $fileId;
+	/**
+	 * Buduje awaryjny adres URL do Memories wykorzystujący mechanizm `single_item`:
+	 * `/apps/memories/?sort=timeline&noinit=1&memories_redirect_fileid=<fileId>#v/<dayId>/<fileId>`
+	 */
+	private function buildMemoriesFallbackUrl(int $fileId, int $dayId): string {
+		return $this->buildMemoriesBaseIndexUrl()
+			. '?sort=timeline&noinit=1&memories_redirect_fileid=' . $fileId
+			. '#v/' . $dayId . '/' . $fileId;
 	}
 
 	/**

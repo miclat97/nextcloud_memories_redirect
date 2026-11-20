@@ -20,5 +20,15 @@ return [
 				'fileId' => '\d+',
 			],
 		],
+		[
+			'name' => 'settings#save',
+			'url' => '/api/settings',
+			'verb' => 'POST',
+		],
+		[
+			'name' => 'settings#reset',
+			'url' => '/api/settings/reset',
+			'verb' => 'POST',
+		],
 	],
 ];

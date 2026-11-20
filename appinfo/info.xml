@@ -2,17 +2,18 @@
 <info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
 	<id>memories_video_redirect</id>
-	<name>Memories Video Redirect</name>
-	<summary>Przekierowuje otwieranie plików wideo z aplikacji Pliki (Files) bezpośrednio do odtwarzacza Memories (go-vod / HLS)</summary>
-	<description><![CDATA[Lekka wtyczka integrująca aplikację Pliki (files) z odtwarzaczem wideo aplikacji Wspomnienia (Memories).
+	<name>Memories Redirect (Video &amp; Photos)</name>
+	<summary>Przekierowuje otwieranie filmów, zdjęć i wybranych typów plików z aplikacji Pliki (Files) bezpośrednio do Memories</summary>
+	<description><![CDATA[Lekka wtyczka integrująca aplikację Pliki (files) z przeglądarką i odtwarzaczem aplikacji Wspomnienia (Memories).
 
 Funkcje:
-- Przechwytuje otwieranie plików wideo (video/*) w aplikacji Pliki i otwiera je bezpośrednio w odtwarzaczu Memories z obsługą transkodowania w locie (go-vod / ffmpeg HLS/DASH).
-- Blokuje domyślny odtwarzacz Nextcloud Viewer przed pobieraniem pełnego surowego pliku wideo przez WebDAV w tle.
-- Dodaje akcję „Odtwórz w Memories” do menu kontekstowego plików wideo jako akcję domyślną.
-- Automatycznie indeksuje w locie nowo wgrane pliki wideo w bazie Memories (oc_memories), zapobiegając błędom 404.
-- Zachowuje czysty adres URL katalogu w historii przeglądarki, dzięki czemu przycisk „Wstecz” (oraz zamknięcie odtwarzacza w Memories) wraca bezpośrednio do katalogu w Plikach bez pętli przekierowań.]]></description>
-	<version>1.0.0</version>
+- Przechwytuje otwieranie filmów (video/*), zdjęć (image/*) oraz dowolnych własnych rozszerzeń zdefiniowanych w ustawieniach w aplikacji Pliki i otwiera je bezpośrednio w Memories.
+- Blokuje domyślny Nextcloud Viewer przed pobieraniem pełnych surowych plików przez WebDAV w tle oraz ich pre-ładowaniem przy przewijaniu.
+- Dodaje akcję „Odtwórz w Memories” / „Otwórz w Memories” do menu kontekstowego plików.
+- Automatycznie indeksuje w locie nowo wgrane pliki w bazie Memories (oc_memories), zapobiegając błędom 404.
+- Udostępnia panel konfiguracyjny dla administratora (wybór typów mediów, własnych/wykluczonych rozszerzeń, wykluczonych katalogów oraz zachowania wtyczki).
+- Zachowuje czysty adres URL katalogu w historii przeglądarki, dzięki czemu przycisk „Wstecz” wraca bezpośrednio do katalogu w Plikach bez pętli przekierowań.]]></description>
+	<version>1.1.0</version>
 	<licence>agpl</licence>
 	<author>miclat97</author>
 	<namespace>MemoriesVideoRedirect</namespace>
@@ -26,4 +27,8 @@ Funkcje:
 		<php min-version="8.1"/>
 		<nextcloud min-version="27" max-version="36"/>
 	</dependencies>
+	<settings>
+		<admin>OCA\MemoriesVideoRedirect\Settings\Admin</admin>
+		<admin-section>OCA\MemoriesVideoRedirect\Settings\AdminSection</admin-section>
+	</settings>
 </info>
